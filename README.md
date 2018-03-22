@@ -1,6 +1,8 @@
 # Ternary Weight Networks (TWNs)
 
-This repository implements the benchmarks in our paper "Ternary Weight Networks" which was accepted by the 1st NIPS Workshop on Efficient Methods for Deep Neural Networks (EMDNN), 2016.  
+The origin repository is [caffe-twns](https://github.com/fengfu-chris/caffe-twns)
+
+I've tried to compile according to the author but got many errors. Found out that the used in the origin repository was already out-of-date. To work with the latest [caffe](https://github.com/BVLC/caffe), the modified codes that support the TWN was split out.
 
 Please cite TWNs in your publications if it helps your research:
 
@@ -14,6 +16,8 @@ Please cite TWNs in your publications if it helps your research:
 ## Build
 
 Dependencies are identical with the master branch of Caffe. Check out [project site](http://caffe.berkeleyvision.org) for detailed instructions.
+
+Just replace the corresponding codes in caffe, and compile.
 
 NOTE:  
 1. Some layers may only have GPU implementation. Thus, CUDA support and GPU devices are required.  

@@ -242,8 +242,9 @@ class Blob {
   Dtype* mutable_cpu_quantum();  // added term
   Dtype* mutable_cpu_acmean();  // added term
   void set_cpu_data(Dtype* data);
-
+  const int* gpu_shape() const;
   const Dtype* gpu_data() const;
+  void set_gpu_data(Dtype* data);
   const Dtype* gpu_diff() const;
   const Dtype* gpu_binary() const; // added term
   const Dtype* gpu_quantum() const; // added term
@@ -253,7 +254,6 @@ class Blob {
   Dtype* mutable_gpu_binary();  // added term
   Dtype* mutable_gpu_quantum();  // added term
   Dtype* mutable_gpu_acmean(); 
-  const int* gpu_shape() const;
 
   void Update();
   void FromProto(const BlobProto& proto, bool reshape = true);

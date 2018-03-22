@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "boost/algorithm/string.hpp"
 #include "caffe/solver.hpp"
 #include "caffe/util/format.hpp"
 #include "caffe/util/hdf5.hpp"
@@ -31,16 +32,14 @@ SolverAction::Enum Solver<Dtype>::GetRequestedAction() {
 }
 
 template <typename Dtype>
-Solver<Dtype>::Solver(const SolverParameter& param, const Solver* root_solver)
-: net_(), callbacks_(), root_solver_(root_solver),
-requested_early_exit_(false) {
-Init(param);
+Solver<Dtype>::Solver(const SolverParameter& param)
+    : net_(), callbacks_(), requested_early_exit_(false) {
+  Init(param);
 }
 
 template <typename Dtype>
-Solver<Dtype>::Solver(const string& param_file, const Solver* root_solver)
-    : net_(), callbacks_(), root_solver_(root_solver),
-      requested_early_exit_(false) {
+Solver<Dtype>::Solver(const string& param_file)
+    : net_(), callbacks_(), requested_early_exit_(false) {
   SolverParameter param;
   ReadSolverParamsFromTextFileOrDie(param_file, &param);
   Init(param);
@@ -48,24 +47,36 @@ Solver<Dtype>::Solver(const string& param_file, const Solver* root_solver)
 
 template <typename Dtype>
 void Solver<Dtype>::Init(const SolverParameter& param) {
-  CHECK(Caffe::root_solver() || root_solver_)
-      << "root_solver_ needs to be set for all non-root solvers";
   LOG_IF(INFO, Caffe::root_solver()) << "Initializing solver from parameters: "
     << std::endl << param.DebugString();
   param_ = param;
   CHECK_GE(param_.average_loss(), 1) << "average_loss should be non-negative.";
   CheckSnapshotWritePermissions();
-  if (Caffe::root_solver() && param_.random_seed() >= 0) {
-    Caffe::set_random_seed(param_.random_seed());
+  if (param_.random_seed() >= 0) {
+    Caffe::set_random_seed(param_.random_seed() + Caffe::solver_rank());
   }
   // Scaffolding code
   InitTrainNet();
+  InitTestNets();
   if (Caffe::root_solver()) {
-    InitTestNets();
     LOG(INFO) << "Solver scaffolding done.";
   }
   iter_ = 0;
   current_step_ = 0;
+}
+
+// Load weights from the caffemodel(s) specified in "weights" solver parameter
+// into the train and test nets.
+template <typename Dtype>
+void LoadNetWeights(shared_ptr<Net<Dtype> > net,
+    const std::string& model_list) {
+  std::vector<std::string> model_names;
+  boost::split(model_names, model_list, boost::is_any_of(","));
+  for (int i = 0; i < model_names.size(); ++i) {
+    boost::trim(model_names[i]);
+    LOG(INFO) << "Finetuning from " << model_names[i];
+    net->CopyTrainedLayersFrom(model_names[i]);
+  }
 }
 
 template <typename Dtype>
@@ -106,16 +117,14 @@ void Solver<Dtype>::InitTrainNet() {
   net_state.MergeFrom(net_param.state());
   net_state.MergeFrom(param_.train_state());
   net_param.mutable_state()->CopyFrom(net_state);
-  if (Caffe::root_solver()) {
-    net_.reset(new Net<Dtype>(net_param));
-  } else {
-    net_.reset(new Net<Dtype>(net_param, root_solver_->net_.get()));
+  net_.reset(new Net<Dtype>(net_param));
+  for (int w_idx = 0; w_idx < param_.weights_size(); ++w_idx) {
+    LoadNetWeights(net_, param_.weights(w_idx));
   }
 }
 
 template <typename Dtype>
 void Solver<Dtype>::InitTestNets() {
-  CHECK(Caffe::root_solver());
   const bool has_net_param = param_.has_net_param();
   const bool has_net_file = param_.has_net();
   const int num_generic_nets = has_net_param + has_net_file;
@@ -185,44 +194,31 @@ void Solver<Dtype>::InitTestNets() {
     net_params[i].mutable_state()->CopyFrom(net_state);
     LOG(INFO)
         << "Creating test net (#" << i << ") specified by " << sources[i];
-    if (Caffe::root_solver()) {
-      test_nets_[i].reset(new Net<Dtype>(net_params[i]));
-    } else {
-      test_nets_[i].reset(new Net<Dtype>(net_params[i],
-          root_solver_->test_nets_[i].get()));
-    }
+    test_nets_[i].reset(new Net<Dtype>(net_params[i]));
     test_nets_[i]->set_debug_info(param_.debug_info());
+    for (int w_idx = 0; w_idx < param_.weights_size(); ++w_idx) {
+      LoadNetWeights(test_nets_[i], param_.weights(w_idx));
+    }
   }
 }
 
 template <typename Dtype>
-void Solver<Dtype>::Step(int iters, float* accuracy_list, float* loss_list, float* accuracy_5_list){
+void Solver<Dtype>::Step(int iters) {
   const int start_iter = iter_;
   const int stop_iter = iter_ + iters;
   int average_loss = this->param_.average_loss();
   losses_.clear();
   smoothed_loss_ = 0;
-
-  Timer timer;
-  timer.Start();
+  iteration_timer_.Start();
 
   while (iter_ < stop_iter) {
     // zero-init the params
     net_->ClearParamDiffs();
     if (param_.test_interval() && iter_ % param_.test_interval() == 0
-        && (iter_ > 0 || param_.test_initialization())
-        && Caffe::root_solver()) {
-
-	 int id = (iter_ - start_iter) / this->param_.test_interval();
-
-      TestAll(&accuracy_list[id], &loss_list[id], &accuracy_5_list[id]);
-
-	  float elapsed_time = timer.Seconds();
-	  LOG(INFO) << "Elapsed time from previous test: " << elapsed_time << " seconds.";  
-	  timer.Start();
-	  // caffe_sleep(1);
-	  LOG(INFO) << "--------------------------------------";
-
+        && (iter_ > 0 || param_.test_initialization())) {
+      if (Caffe::root_solver()) {
+        TestAll();
+      }
       if (requested_early_exit_) {
         // Break out of the while loop because stop was requested while testing.
         break;
@@ -243,8 +239,13 @@ void Solver<Dtype>::Step(int iters, float* accuracy_list, float* loss_list, floa
     // average the loss across iterations for smoothed reporting
     UpdateSmoothedLoss(loss, start_iter, average_loss);
     if (display) {
+      float lapse = iteration_timer_.Seconds();
+      float per_s = (iter_ - iterations_last_) / (lapse ? lapse : 1);
       LOG_IF(INFO, Caffe::root_solver()) << "Iteration " << iter_
-          << ", loss = " << smoothed_loss_;
+          << " (" << per_s << " iter/s, " << lapse << "s/"
+          << param_.display() << " iters), loss = " << smoothed_loss_;
+      iteration_timer_.Start();
+      iterations_last_ = iter_;
       const vector<Blob<Dtype>*>& result = net_->output_blobs();
       int score_index = 0;
       for (int j = 0; j < result.size(); ++j) {
@@ -270,8 +271,6 @@ void Solver<Dtype>::Step(int iters, float* accuracy_list, float* loss_list, floa
     }
     ApplyUpdate();
 
-// if(DEBUG) caffe_sleep(3);
-
     // Increment the internal iter_ counter -- its value should always indicate
     // the number of times the weights have been updated.
     ++iter_;
@@ -291,8 +290,6 @@ void Solver<Dtype>::Step(int iters, float* accuracy_list, float* loss_list, floa
       break;
     }
   }
-
-  timer.Stop();
 }
 
 template <typename Dtype>
@@ -312,14 +309,7 @@ void Solver<Dtype>::Solve(const char* resume_file) {
   // For a network that is trained by the solver, no bottom or top vecs
   // should be given, and we will just provide dummy vecs.
   int start_iter = iter_;
-
-  const int iters = this->param_.max_iter() - iter_;
-  const int nn = iters / this->param_.test_interval() + 1;
-  float* accuracy_list = new float[nn];
-  float* loss_list = new float[nn];
-  float* accuracy_5_list = new float[nn];
-
-  Step(param_.max_iter() - iter_, accuracy_list, loss_list, accuracy_5_list);
+  Step(param_.max_iter() - iter_);
   // If we haven't already, save a snapshot after optimization, unless
   // overridden by setting snapshot_after_train := false
   if (param_.snapshot_after_train()
@@ -346,52 +336,22 @@ void Solver<Dtype>::Solve(const char* resume_file) {
     LOG(INFO) << "Iteration " << iter_ << ", loss = " << smoothed_loss_;
   }
   if (param_.test_interval() && iter_ % param_.test_interval() == 0) {
-     TestAll(&accuracy_list[nn-1], &loss_list[nn-1], &accuracy_5_list[nn-1]);
+    TestAll();
   }
   LOG(INFO) << "Optimization Done.";
-
-  std::cout << "\n--------- accuracy list ------" << std::endl;
-  std::cout << "" << accuracy_list[0] << std::endl;
-  for(int i=1; i<nn; i++){
-	std::cout << accuracy_list[i] << " ";
-	if(i%10 == 0){
-		std::cout << std::endl;
-	}
-  }
-  std::cout << "\n--------- loss list ------" << std::endl;
-  std::cout << "" << accuracy_list[0] << std::endl;
-  for(int i=1; i<nn; i++){
-	std::cout << loss_list[i] << " ";
-	if(i%10 == 0){
-		std::cout << std::endl;
-	}
-  }
-  std::cout << "\n------ top 5 accuracy list ------" << std::endl;
-  std::cout << "" << accuracy_list[0] << std::endl;
-  for(int i=1; i<nn; i++){
-	std::cout << accuracy_5_list[i] << " ";
-	if(i%10 == 0){
-		std::cout << std::endl;
-	}
-  }
-  std::cout << "\n----------- end -------------\n" << std::endl;
-
-  delete[] accuracy_list;
-  delete[] loss_list;
-  delete[] accuracy_5_list;
 }
 
 template <typename Dtype>
-void Solver<Dtype>::TestAll(float* accuracy, float* loss_in, float* accuracy_5) {
+void Solver<Dtype>::TestAll() {
   for (int test_net_id = 0;
        test_net_id < test_nets_.size() && !requested_early_exit_;
        ++test_net_id) {
-    Test(test_net_id, accuracy, loss_in, accuracy_5);
+    Test(test_net_id);
   }
 }
 
 template <typename Dtype>
-void Solver<Dtype>::Test(const int test_net_id, float* accuracy, float* loss_in, float* accuracy_5) {
+void Solver<Dtype>::Test(const int test_net_id) {
   CHECK(Caffe::root_solver());
   LOG(INFO) << "Iteration " << iter_
             << ", Testing net (#" << test_net_id << ")";
@@ -458,7 +418,7 @@ void Solver<Dtype>::Test(const int test_net_id, float* accuracy, float* loss_in,
     const Dtype mean_score = test_score[i] / param_.test_iter(test_net_id);
 
 // added @ 2016-4-1
-if(output_name.compare("accuracy")==0 && accuracy){
+/*if(output_name.compare("accuracy")==0 && accuracy){
 	*accuracy = (float) mean_score;
 }
 if(output_name.compare("loss")==0 && loss_in){
@@ -466,7 +426,7 @@ if(output_name.compare("loss")==0 && loss_in){
 }
 if(output_name.compare("accuracy_5")==0 && accuracy_5){
     *accuracy_5 = (float) mean_score;
-}
+}*/
 	
     if (loss_weight) {
       loss_msg_stream << " (* " << loss_weight
@@ -562,7 +522,6 @@ string Solver<Dtype>::SnapshotToHDF5() {
 
 template <typename Dtype>
 void Solver<Dtype>::Restore(const char* state_file) {
-  CHECK(Caffe::root_solver());
   string state_filename(state_file);
   if (state_filename.size() >= 3 &&
       state_filename.compare(state_filename.size() - 3, 3, ".h5") == 0) {
